@@ -75,7 +75,7 @@
 
 /* enums */
 enum { CurNormal, CurResize, CurMove, CurLast }; /* cursor */
-enum { SchemeNorm, SchemeSel, SchemeHid }; /* color schemes */
+enum { SchemeNorm, SchemeSel, SchemeHov, SchemeHid }; /* color schemes */
 enum { NetSupported, NetWMName, NetWMState, NetWMCheck,
        NetSystemTray, NetSystemTrayOP, NetSystemTrayOrientation, NetSystemTrayOrientationHorz,
        NetWMFullscreen, NetActiveWindow, NetWMWindowType,
@@ -155,6 +155,7 @@ struct Monitor {
 	int hidsel;
 	Client *clients;
 	Client *sel;
+	Client *hov;
 	Client *stack;
 	Monitor *next;
 	Window barwin;
@@ -257,10 +258,12 @@ static void show(const Arg *arg);
 static void showall(const Arg *arg);
 static void showwin(Client *c);
 static void showhide(Client *c);
+static int solitary(Client *c);
 static void spawn(const Arg *arg);
 static Monitor *systraytomon(Monitor *m);
 static void tag(const Arg *arg);
 static void tagmon(const Arg *arg);
+static void tile(Monitor *m);
 static void togglebar(const Arg *arg);
 static void togglefloating(const Arg *arg);
 static void togglescratch(const Arg *arg);
@@ -297,9 +300,9 @@ static void takepreview(void);
 static void previewtag(const Arg *arg);
 
 /* variables */
+static Systray *systray = NULL;
 static const char autostartblocksh[] = "autostart_blocking.sh";
 static const char autostartsh[] = "autostart.sh";
-static Systray *systray = NULL;
 static const char broken[] = "broken";
 static const char dwmdir[] = "dwm";
 static const char localshare[] = ".local/share";
@@ -339,6 +342,8 @@ static Window root, wmcheckwin;
 /* configuration, allows nested code to access above variables */
 #include "config.h"
 
+static unsigned int scratchtag = 1 << LENGTH(tags);
+
 struct Pertag {
 	unsigned int curtag, prevtag; /* current and previous tag */
 	int nmasters[LENGTH(tags) + 1]; /* number of windows in master area */
@@ -347,8 +352,6 @@ struct Pertag {
 	const Layout *ltidxs[LENGTH(tags) + 1][2]; /* matrix of tags and layouts indexes  */
 	int showbars[LENGTH(tags) + 1]; /* display bar for the current tag */
 };
-
-static unsigned int scratchtag = 1 << LENGTH(tags);
 
 /* compile-time check if all tags fit into an unsigned int bit array. */
 struct NumTags { char limitexceeded[LENGTH(tags) > 31 ? -1 : 1]; };
@@ -514,7 +517,7 @@ buttonpress(XEvent *e)
 		i = x = 0;
 		unsigned int occ = 0;
 		for(c = m->clients; c; c=c->next)
-			occ |= c->tags == TAGMASK ? 0 : c->tags;
+			occ |= c->tags;
 		do {
 			/* Do not reserve space for vacant tags */
 			if (!(occ & 1 << i || m->tagset[m->seltags] & 1 << i))
@@ -529,10 +532,10 @@ buttonpress(XEvent *e)
 				selmon->previewshow = 0;
 				XUnmapWindow(dpy, selmon->tagwin);
 			}
-		} else if (ev->x < x + (int)TEXTW(selmon->ltsymbol) - getsystraywidth())
+		} else if (ev->x < x + TEXTW(selmon->ltsymbol))
 			click = ClkLtSymbol;
 		/* 2px right padding */
-		else if (ev->x > selmon->ww - TEXTW(stext) + lrpad - 2)
+		else if (ev->x > selmon->ww - (int)TEXTW(stext) - getsystraywidth())
 			click = ClkStatusText;
 		else {
 			x += TEXTW(selmon->ltsymbol);
@@ -912,7 +915,9 @@ drawbar(Monitor *m)
 
 	resizebarwin(m);
 	for (c = m->clients; c; c = c->next) {
-		occ |= c->tags == TAGMASK ? 0 : c->tags;
+		if (ISVISIBLE(c))
+			n++;
+		occ |= c->tags;
 		if (c->isurgent)
 			urg |= c->tags;
 	}
@@ -937,7 +942,9 @@ drawbar(Monitor *m)
 			for (c = m->clients; c; c = c->next) {
 				if (!ISVISIBLE(c))
 					continue;
-				if (m->sel == c)
+				if (m->hov == c)
+					scm = SchemeHov;
+				else if (m->sel == c)
 					scm = SchemeSel;
 				else if (HIDDEN(c))
 					scm = SchemeHid;
@@ -1050,7 +1057,11 @@ focus(Client *c)
 		detachstack(c);
 		attachstack(c);
 		grabbuttons(c, 1);
-		XSetWindowBorder(dpy, c->win, scheme[SchemeSel][ColBorder].pixel);
+		/* Avoid flickering when another client appears and the border
+		 * is restored */
+		if (!solitary(c)) {
+			XSetWindowBorder(dpy, c->win, scheme[SchemeSel][ColBorder].pixel);
+		}
 		setfocus(c);
 	} else {
 		XSetInputFocus(dpy, root, RevertToPointerRoot, CurrentTime);
@@ -1467,7 +1478,9 @@ monocle(Monitor *m)
 void
 motionnotify(XEvent *e)
 {
+	// int x, i;
 	static Monitor *mon = NULL;
+	Client *c;
 	Monitor *m;
 	XMotionEvent *ev = &e->xmotion;
 	unsigned int i, x;
@@ -1501,14 +1514,70 @@ motionnotify(XEvent *e)
 		XUnmapWindow(dpy, selmon->tagwin);
 	}
 
-	if (ev->window != root)
+	if (ev->window != selmon->barwin) {
+		if (selmon->hov) {
+			if (selmon->hov != selmon->sel)
+				XSetWindowBorder(dpy, selmon->hov->win, scheme[SchemeNorm][ColBorder].pixel);
+			else
+				XSetWindowBorder(dpy, selmon->hov->win, scheme[SchemeSel][ColBorder].pixel);
+			
+			selmon->hov = NULL;
+			c = wintoclient(ev->window);
+			m = c ? c->mon : wintomon(ev->window);
+			drawbar(m);
+		}
+
+		if (ev->window == root) {
+			if ((m = recttomon(ev->x_root, ev->y_root, 1, 1)) != mon && mon) {
+				unfocus(selmon->sel, 1);
+				selmon = m;
+				focus(NULL);
+			}
+			mon = m;
+		}
+	
 		return;
-	if ((m = recttomon(ev->x_root, ev->y_root, 1, 1)) != mon && mon) {
-		unfocus(selmon->sel, 1);
-		selmon = m;
-		focus(NULL);
 	}
-	mon = m;
+
+	c = wintoclient(ev->window);
+	m = c ? c->mon : wintomon(ev->window);
+	c = m->clients;
+
+	x = 0, i = 0;
+	do
+		x += TEXTW(tags[i]);
+	while (ev->x >= x && ++i < LENGTH(tags));
+	if (i < LENGTH(tags) || ev->x < x + TEXTW(selmon->ltsymbol) || ev->x > selmon->ww - TEXTW(stext) + lrpad - 2) {
+		if (selmon->hov) {
+			if (selmon->hov != selmon->sel)
+				XSetWindowBorder(dpy, selmon->hov->win, scheme[SchemeNorm][ColBorder].pixel);
+			else
+				XSetWindowBorder(dpy, selmon->hov->win, scheme[SchemeSel][ColBorder].pixel);
+			selmon->hov = NULL;
+			drawbar(m);
+		}
+	} else {
+		x += TEXTW(selmon->ltsymbol);
+		if (c) {
+			do {
+				if (!ISVISIBLE(c))
+					continue;
+				else
+					x +=(1.0 / (double)m->bt) * m->btw;
+			} while (ev->x > x && (c = c->next));
+			if (c) {
+				if (selmon->hov) {
+					if (selmon->hov != selmon->sel)
+						XSetWindowBorder(dpy, selmon->hov->win, scheme[SchemeNorm][ColBorder].pixel);
+					else
+						XSetWindowBorder(dpy, selmon->hov->win, scheme[SchemeSel][ColBorder].pixel);
+				}
+				selmon->hov = c;
+				XSetWindowBorder(dpy, c->win, scheme[SchemeHov][ColBorder].pixel);
+			}
+		}
+		drawbar(m);
+	}
 }
 
 void
@@ -1703,6 +1772,11 @@ resizeclient(Client *c, int x, int y, int w, int h)
 	c->oldw = c->w; c->w = wc.width = w;
 	c->oldh = c->h; c->h = wc.height = h;
 	wc.border_width = c->bw;
+	if (solitary(c)) {
+		c->w = wc.width += c->bw * 2;
+		c->h = wc.height += c->bw * 2;
+		wc.border_width = 0;
+	}
 	XConfigureWindow(dpy, c->win, CWX|CWY|CWWidth|CWHeight|CWBorderWidth, &wc);
 	configure(c);
 	XSync(dpy, False);
@@ -2322,6 +2396,15 @@ showhide(Client *c)
 	}
 }
 
+int
+solitary(Client *c)
+{
+	return ((nexttiled(c->mon->clients) == c && !nexttiled(c->next))
+	    || &monocle == c->mon->lt[c->mon->sellt]->arrange)
+	    && !c->isfullscreen && !c->isfloating
+	    && NULL != c->mon->lt[c->mon->sellt]->arrange;
+}
+
 void
 spawn(const Arg *arg)
 {
@@ -2581,6 +2664,7 @@ updatebars(void)
 		if (showsystray && m == systraytomon(m))
 			XMapRaised(dpy, systray->win);
 		XMapRaised(dpy, m->barwin);
+		XSelectInput(dpy, m->barwin, ButtonPressMask|PointerMotionMask);
 		XSetClassHint(dpy, m->barwin, &ch);
 	}
 }
@@ -2599,7 +2683,7 @@ updatebarpos(Monitor *m)
 }
 
 void
-updateclientlist(void)
+updateclientlist()
 {
 	Client *c;
 	Monitor *m;
