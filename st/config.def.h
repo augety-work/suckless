@@ -6,6 +6,12 @@
  * font: see http://freedesktop.org/software/fontconfig/fontconfig-user.html
  */
 static char *font = "Hack Nerd Font Mono:pixelsize=19:antialias=true:autohint=true";
+static char *font2[] = {
+	"WenQuanYi Micro Hei:pixelsize=19:antialias=true",
+	"Noto Color Emoji:pixelsize=19:antialias=true",
+	"Hack Nerd Font Mono:pixelsize=19:antialias=true:autohint=true",
+	"MesloLGS NF Regular:pixelsize=19:antialias=true:autohint=true",
+};
 static int borderpx = 2;
 
 /*
